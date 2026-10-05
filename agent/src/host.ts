@@ -28,11 +28,21 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Checkpoints } from "./checkpoints.js";
 import { Container, type Distro } from "./container.js";
+import {
+	type CustomProvider,
+	isLocalEndpoint,
+	isUsableId,
+	loadCustomProviders,
+	normalizeBaseUrl,
+	saveCustomProviders,
+	slugify,
+} from "./custom_providers.js";
 import { installDohLookup } from "./dns.js";
 import * as gitops from "./gitops.js";
 import { Guard } from "./guard.js";
 import { Integrations, type Log } from "./integrations.js";
 import { installLenientTools } from "./lenient.js";
+import { descriptorFor, fetchLiveModels, isFree } from "./live_models.js";
 import { Mcp } from "./mcp.js";
 import { type RunSession, Runner } from "./runs.js";
 import { Skills } from "./skills.js";
@@ -329,17 +339,240 @@ async function login(providerId: string, method: "api_key" | "oauth") {
 	});
 }
 
+// ---------------------------------------------------------------------------
+// Providers
+//
+// pi ships a generated catalog of models per provider. It is replaced with the
+// list each provider reports for the credential the user entered, so the picker
+// shows exactly the models that key can reach (#4). Custom OpenAI-compatible
+// endpoints and local inference servers ride the same path (#5, #6).
+
+/** Provider ids whose model list we already replaced with a live fetch. */
+const liveRefreshed = new Set<string>();
+
+/**
+ * Registers a live model refresh for one provider.
+ *
+ * `refreshModels` receives the effective credential, so the fetch is
+ * authenticated with the user's own key. Returning a list makes pi swap it in
+ * place of the bundled catalog; throwing (or returning the bundled list) keeps
+ * the provider working offline.
+ */
+async function registerLiveModels(providerId: string) {
+	const provider = modelRuntime.getProvider(providerId);
+	if (!provider || liveRefreshed.has(providerId)) return;
+
+	// Only providers that publish a model list are worth calling out to.
+	// Anthropic and Google have no such endpoint, so they keep the curated
+	// catalog instead of reporting a guessed number.
+	const known = modelRuntime.getModels(providerId);
+	const descriptor = descriptorFor(providerId);
+	if (!descriptor || known.length === 0) return;
+
+	const api = known.find((m) => m.api)?.api ?? "openai-completions";
+	const baseUrl = known.find((m) => m.baseUrl)?.baseUrl ?? provider.baseUrl;
+	if (!baseUrl) return;
+
+	liveRefreshed.add(providerId);
+	try {
+		modelRuntime.registerProvider(providerId, {
+			name: provider.name,
+			baseUrl,
+			api,
+			models: known.map((m) => toModelDefinition(m)),
+			refreshModels: async (context) => {
+				const live = await fetchLiveModels({
+					providerId,
+					baseUrl,
+					api,
+					descriptor,
+					credential: context.credential,
+					signal: context.signal,
+					fallbacks: known,
+				});
+				// Keep the previous list on failure; fetchLiveModels already
+				// falls back, so an empty result means the provider genuinely
+				// reports nothing usable.
+				return live.length ? live : known.map((m) => toModelDefinition(m));
+			},
+		});
+	} catch (error) {
+		liveRefreshed.delete(providerId);
+		log("providers:", providerId, "live models unavailable:", String(error));
+	}
+}
+
+/** pi's `Model` -> the definition shape `ProviderConfigInput.models` accepts. */
+function toModelDefinition(model: any) {
+	return {
+		id: model.id,
+		name: model.name ?? model.id,
+		api: model.api,
+		baseUrl: model.baseUrl,
+		reasoning: !!model.reasoning,
+		input: model.input ?? ["text"],
+		cost: model.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: model.contextWindow ?? 128000,
+		maxTokens: model.maxTokens ?? 8192,
+	};
+}
+
+/**
+ * Adds a user-defined OpenAI-compatible provider. Covers a hosted API with the
+ * user's own key (#5) and a local server such as Ollama or LM Studio (#6);
+ * `apiKey` is optional because local servers ignore it.
+ */
+async function addCustomProvider(input: {
+	name?: string;
+	baseUrl?: string;
+	apiKey?: string;
+	api?: string;
+	id?: string;
+}) {
+	const baseUrl = normalizeBaseUrl(String(input.baseUrl ?? ""));
+	if (!/^https?:\/\//i.test(baseUrl)) throw new Error("Enter a full endpoint URL, e.g. https://api.example.com/v1");
+
+	const existing = loadCustomProviders(stateDir);
+	const name = String(input.name ?? "").trim() || hostLabel(baseUrl);
+	const id = slugify(String(input.id ?? name));
+	if (!isUsableId(id, existing)) throw new Error(`"${id}" is reserved or already in use`);
+
+	const entry: CustomProvider = {
+		id,
+		name,
+		baseUrl,
+		apiKey: input.apiKey ? String(input.apiKey).trim() : undefined,
+		api: input.api || "openai-completions",
+	};
+	// persist first: pi registration is re-applied on next start, and a
+	// provider that vanishes on restart would be worse than a rejected entry.
+	saveCustomProviders(stateDir, [...existing.filter((p) => p.id !== id), entry]);
+	await applyCustomProvider(entry);
+	return { provider: describeCustomProvider(entry), providers: await providers() };
+}
+
+/** Falls back to the endpoint's host when the user left the name blank. */
+function hostLabel(baseUrl: string) {
+	try {
+		return new URL(baseUrl).host;
+	} catch {
+		return baseUrl;
+	}
+}
+
+function describeCustomProvider(entry: CustomProvider) {
+	return {
+		id: entry.id,
+		name: entry.name,
+		local: isLocalEndpoint(entry.baseUrl),
+		baseUrl: entry.baseUrl,
+		api: entry.api ?? "openai-completions",
+	};
+}
+
+/**
+ * Registers one stored custom provider with pi. The model list is always empty
+ * on purpose: it is filled from the endpoint's own `/models`, so nothing is
+ * invented and no bundled count is reused.
+ */
+async function applyCustomProvider(entry: CustomProvider) {
+	const api = entry.api ?? "openai-completions";
+	const provider = modelRuntime.getProvider(entry.id);
+	const baseUrl = provider?.baseUrl ?? entry.baseUrl;
+
+	// A local server usually accepts any non-empty key; pi refuses to compose a
+	// provider without one.
+	const apiKey = entry.apiKey || (isLocalEndpoint(entry.baseUrl) ? "local" : entry.baseUrl);
+
+	modelRuntime.registerProvider(entry.id, {
+		name: entry.name,
+		baseUrl,
+		apiKey,
+		api,
+		models: [],
+		refreshModels: async (context) => {
+			const live = await fetchLiveModels({
+				providerId: entry.id,
+				baseUrl,
+				api,
+				descriptor: { path: "/models" },
+				credential: context.credential,
+				signal: context.signal,
+			});
+			// An unreachable server keeps the provider registered and empty;
+			// the UI reports zero models rather than a stale count.
+			return live.map((m) => ({ ...m, baseUrl }));
+		},
+	});
+
+	if (entry.apiKey) {
+		try {
+			await modelRuntime.setRuntimeApiKey(entry.id, entry.apiKey);
+		} catch {
+			// The key is also supplied above, so a store failure is not fatal.
+		}
+	}
+	liveRefreshed.add(entry.id);
+}
+
+/** Re-registers every stored custom provider, e.g. after one is edited. */
+async function applyCustomProviders() {
+	for (const entry of loadCustomProviders(stateDir)) {
+		try {
+			await applyCustomProvider(entry);
+		} catch (error) {
+			log("providers:", entry.id, String(error));
+		}
+	}
+}
+
+async function removeCustomProvider(id: string) {
+	const existing = loadCustomProviders(stateDir);
+	const next = existing.filter((p) => p.id !== id);
+	if (next.length === existing.length) throw new Error(`No custom provider "${id}"`);
+	saveCustomProviders(stateDir, next);
+	try {
+		modelRuntime.unregisterProvider(id);
+	} catch {
+		// Already gone; the persisted state is what matters.
+	}
+	liveRefreshed.delete(id);
+	return { providers: await providers() };
+}
+
+/** Refreshes live catalogs for every provider that publishes one. */
+async function refreshModels(providerId?: string, force = true) {
+	try {
+		const result = await modelRuntime.refresh({ allowNetwork: true, force, ...(providerId ? { providers: [providerId] } : {}) });
+		return {
+			aborted: result?.aborted ?? false,
+			failed: result?.errors ? [...result.errors.keys()] : [],
+			providers: await providers(),
+		};
+	} catch (error) {
+		throw new Error(`Could not refresh models: ${String(error)}`);
+	}
+}
+
 async function providers() {
 	const out = [];
 	for (const p of modelRuntime.getProviders()) {
 		const auth = p.auth as any;
+		const models = modelRuntime.getModels(p.id);
+		const custom = loadCustomProviders(stateDir).find((c) => c.id === p.id);
 		out.push({
 			id: p.id,
 			name: p.name,
 			configured: modelRuntime.hasConfiguredAuth(p.id),
 			oauth: modelRuntime.isUsingOAuth(p.id),
 			methods: [auth.apiKey?.login ? "api_key" : null, auth.oauth ? "oauth" : null].filter(Boolean),
-			models: modelRuntime.getModels(p.id).length,
+			// Counts the models actually available now, not a baked-in number.
+			models: models.length,
+			free: models.filter(isFree).length,
+			live: liveRefreshed.has(p.id),
+			custom: !!custom,
+			local: custom ? isLocalEndpoint(custom.baseUrl) : false,
+			baseUrl: custom?.baseUrl ?? models.find((m) => m.baseUrl)?.baseUrl ?? null,
 		});
 	}
 	return out;
@@ -470,7 +703,18 @@ async function handle(cmd: Command): Promise<unknown> {
 		case "providers":
 			return providers();
 		case "models":
-			return (await modelRuntime.getAvailable(cmd.provider)).map(modelInfo);
+			return (await modelRuntime.getAvailable(cmd.provider)).map((m) => ({ ...modelInfo(m), free: isFree(toModelDefinition(m)) }));
+		case "add_provider":
+			return addCustomProvider(cmd);
+		case "remove_provider":
+			return removeCustomProvider(String(cmd.provider ?? ""));
+		case "custom_providers":
+			return loadCustomProviders(stateDir).map(describeCustomProvider);
+		case "refresh_models":
+			// Registering happens up front; refreshing re-pulls from the API so
+			// a newly issued key is reflected without restarting.
+			if (cmd.provider) await registerLiveModels(String(cmd.provider));
+			return refreshModels(cmd.provider ? String(cmd.provider) : undefined, cmd.force !== false);
 		case "set_model": {
 			const model = modelRuntime.getModel(cmd.provider, cmd.model);
 			if (!model) throw new Error(`Unknown model ${cmd.provider}/${cmd.model}`);
@@ -483,6 +727,10 @@ async function handle(cmd: Command): Promise<unknown> {
 
 		case "login":
 			await login(cmd.provider, cmd.method ?? "api_key");
+			// A fresh key changes which models this provider reports, so pull
+			// the live list rather than showing the previous key's models.
+			await registerLiveModels(cmd.provider);
+			await modelRuntime.refresh({ allowNetwork: true, force: true, providers: [cmd.provider] }).catch(() => {});
 			return providers();
 		case "auth_reply": {
 			const pending = pendingAuth.get(cmd.authId);
@@ -536,10 +784,18 @@ async function handle(cmd: Command): Promise<unknown> {
 			return integrations.githubLogout();
 		case "github_repos":
 			return integrations.repos();
+		case "gitlab_login":
+			return integrations.gitlabLogin(cmd.token, cmd.host ?? "gitlab.com");
+		case "gitlab_logout":
+			return integrations.gitlabLogout();
 		case "git_clone":
-			return integrations.clone(cmd.repo, taskLog(cmd));
+			return integrations.clone(cmd.repo, taskLog(cmd), cmd.host ?? "github.com");
 		case "projects":
 			return integrations.projects();
+		case "project_rename":
+			return integrations.renameProject(cmd.name, cmd.next);
+		case "project_delete":
+			return integrations.deleteProject(cmd.name);
 		case "ssh_key":
 			return integrations.sshKey();
 		case "ssh_host_save":
@@ -816,7 +1072,11 @@ async function main() {
 	checkpoints = new Checkpoints(join(stateDir, "checkpoints"));
 	container = new Container(process.env.ANDROPI_FILES ?? join(agentDir, "..", "..", ".."));
 	mcp = new Mcp(join(stateDir, "mcp.json"), () => send({ type: "mcp", servers: mcp.summary() }));
-	modelRuntime = await ModelRuntime.create();
+	modelRuntime = await ModelRuntime.create({ allowModelNetwork: true, modelRefreshTimeoutMs: 15_000 });
+	// Custom and local providers are registered before the first session so
+	// their models are available immediately, and the live catalog hooks are
+	// installed for every provider that publishes a model list.
+	await applyCustomProviders();
 	settingsManager = SettingsManager.create(workspace, agentDir);
 	// Linux container is the agent's shell by default once installed.
 	if (

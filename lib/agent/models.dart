@@ -11,6 +11,10 @@ class ModelInfo {
   int? get contextWindow => json['contextWindow'] as int?;
   bool get acceptsImages => (json['input'] as List?)?.contains('image') ?? false;
   String get key => '$provider/$id';
+
+  /// True when the provider quotes no price for this model. Live local models
+  /// and open-weights endpoints report no cost, so they read as free.
+  bool get isFree => json['free'] == true;
 }
 
 class ProviderInfo {
@@ -22,7 +26,36 @@ class ProviderInfo {
   bool get configured => json['configured'] == true;
   bool get oauth => json['oauth'] == true;
   List<String> get methods => (json['methods'] as List? ?? const []).cast<String>();
+
+  /// Number of models this provider currently offers, counted after the live
+  /// list was applied — never a bundled constant.
   int get modelCount => json['models'] as int? ?? 0;
+
+  /// How many of those cost nothing to run.
+  int get freeCount => json['free'] as int? ?? 0;
+
+  /// True when the model list is fetched from the provider instead of bundled.
+  bool get live => json['live'] == true;
+
+  /// User-defined endpoint rather than a built-in provider.
+  bool get custom => json['custom'] == true;
+
+  /// Endpoint reachable on this device or the local network (Ollama etc.).
+  bool get local => json['local'] == true;
+
+  String? get baseUrl => json['baseUrl'] as String?;
+}
+
+/// A user-defined provider as stored by the agent.
+class CustomProvider {
+  CustomProvider(this.json);
+  final Map<String, dynamic> json;
+
+  String get id => json['id'] as String;
+  String get name => json['name'] as String? ?? id;
+  String get baseUrl => json['baseUrl'] as String? ?? '';
+  bool get local => json['local'] == true;
+  String get api => json['api'] as String? ?? 'openai-completions';
 }
 
 class SessionSummary {

@@ -64,7 +64,15 @@ let after = 0;
 function minify(dir) {
 	for (const name of readdirSync(dir)) {
 		const path = join(dir, name);
-		if (statSync(path).isDirectory()) {
+		// Pruning leaves dangling symlinks behind (e.g. .bin/pi, whose target lived in the removed
+		// dist/bundle). statSync() follows symlinks and throws on those, so skip anything unresolvable.
+		let stats;
+		try {
+			stats = statSync(path);
+		} catch {
+			continue;
+		}
+		if (stats.isDirectory()) {
 			minify(path);
 			continue;
 		}
@@ -113,7 +121,7 @@ const stamp = `${piVersion} ${Date.now()}`;
 rmSync(join(assets, "agent"), { recursive: true, force: true });
 mkdirSync(assets, { recursive: true });
 execSync(
-	`python -c "import shutil,sys; shutil.make_archive(sys.argv[1], 'zip', sys.argv[2])" "${join(assets, "agent")}" "${out}"`,
+	`${process.env.PYTHON ?? "python3"} -c "import shutil,sys; shutil.make_archive(sys.argv[1], 'zip', sys.argv[2])" "${join(assets, "agent")}" "${out}"`,
 	{ stdio: "inherit" },
 );
 writeFileSync(join(assets, "agent.stamp"), stamp);

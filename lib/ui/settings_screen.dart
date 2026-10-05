@@ -3,6 +3,7 @@ import 'package:lucide_icons_flutter/lucide_icons.dart';
 
 import '../agent/agent_controller.dart';
 import '../agent/models.dart';
+import 'custom_provider_ui.dart';
 import 'login_flow.dart';
 import 'kit.dart';
 import 'theme.dart';
@@ -68,6 +69,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
               ),
               for (final pr in others) _ProviderTile(provider: pr, agent: agent),
+              CustomProviderSection(agent: agent),
               const _Header('Environment'),
               _InfoRow('pi', agent.info['version']?.toString() ?? '—'),
               _InfoRow('Node.js', agent.info['node']?.toString() ?? '—'),
@@ -133,7 +135,7 @@ class _ProviderTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final p = context.palette;
-    final subtitle = provider.configured ? (provider.oauth ? 'Signed in' : 'API key') : '${provider.modelCount} models';
+    final subtitle = provider.configured ? _status(provider) : '${provider.modelCount} models';
     return ListTile(
       contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 2),
       leading: BrandTile(id: provider.id, size: 38),
@@ -144,6 +146,15 @@ class _ProviderTile extends StatelessWidget {
           : Icon(LucideIcons.chevronRight, size: 18, color: p.faint),
       onTap: () => _open(context),
     );
+  }
+
+  /// Counts are read from the live list, and the free total is shown so a key
+  /// that mostly exposes no-cost models is obvious at a glance.
+  String _status(ProviderInfo provider) {
+    final base = provider.oauth ? 'Signed in' : 'API key';
+    final parts = <String>['${provider.modelCount} models'];
+    if (provider.freeCount > 0) parts.add('${provider.freeCount} free');
+    return '$base · ${parts.join(' · ')}';
   }
 
   Future<void> _open(BuildContext context) async {

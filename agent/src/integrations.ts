@@ -8,8 +8,8 @@
 
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { basename, join, relative } from "node:path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { basename, join, relative, resolve, sep } from "node:path";
 import { configureDns, type DnsMode } from "./dns.js";
 import { readSecureJson, writeSecureJson } from "./secure.js";
 
@@ -25,6 +25,7 @@ export interface SshHost {
 
 interface Store {
 	github?: { token: string; login: string; name: string | null; email: string; avatarUrl: string };
+	gitlab?: { token: string; login: string; name: string | null; email: string; avatarUrl: string; host: string };
 	vercel?: { token: string; username: string };
 	sshHosts: SshHost[];
 	settings?: AppSettings;
@@ -144,15 +145,19 @@ export class Integrations {
 			if (gh) process.env[key] = gh;
 			else delete process.env[key];
 		}
+		const gl = this.store.gitlab?.token;
+		if (gl) process.env.GITLAB_TOKEN = gl;
+		else delete process.env.GITLAB_TOKEN;
 		if (this.store.vercel) process.env.VERCEL_TOKEN = this.store.vercel.token;
 		else delete process.env.VERCEL_TOKEN;
 	}
 
 	summary() {
-		const { github, vercel, sshHosts } = this.store;
+		const { github, gitlab, vercel, sshHosts } = this.store;
 		const pub = join(this.home, ".ssh", "id_ed25519.pub");
 		return {
 			github: github ? { login: github.login, name: github.name, avatarUrl: github.avatarUrl } : null,
+			gitlab: gitlab ? { login: gitlab.login, name: gitlab.name, avatarUrl: gitlab.avatarUrl, host: gitlab.host } : null,
 			vercel: vercel ? { username: vercel.username } : null,
 			ssh: { publicKey: existsSync(pub) ? readFileSync(pub, "utf8").trim() : null, hosts: sshHosts },
 		};
@@ -270,6 +275,104 @@ export class Integrations {
 		return this.summary();
 	}
 
+	// -------------------------------------------------------------------------
+	// GitLab
+	//
+	// gitlab.com is the default, but self-hosted instances are supported: the
+	// host is stored with the token and every API call and clone URL is built
+	// from it.
+
+	/** Normalizes what the user typed into an API base, e.g. https://gitlab.com/api/v4 */
+	private gitlabApiBase(host?: string) {
+		const raw = (host ?? this.store.gitlab?.host ?? "gitlab.com").trim().replace(/\/+$/, "");
+		const url = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+		// Accept the web URL or the API URL, and settle on the API base.
+		return url.replace(/\/api\/v4$/i, "") + "/api/v4";
+	}
+
+	private async gitlab(path: string, init: RequestInit = {}, token = this.store.gitlab?.token) {
+		if (!token) throw new Error("Not signed in to GitLab");
+		const res = await fetch(`${this.gitlabApiBase()}${path}`, {
+			...init,
+			headers: {
+				Accept: "application/json",
+				"PRIVATE-TOKEN": token,
+				...(init.body ? { "Content-Type": "application/json" } : {}),
+				...init.headers,
+			},
+		});
+		const body = res.status === 204 ? null : await res.json().catch(() => null);
+		if (!res.ok) {
+			const message = (body as any)?.message ?? (body as any)?.error ?? res.statusText;
+			const err = new Error(`GitLab: ${message} (${res.status})`) as Error & { status?: number };
+			err.status = res.status;
+			throw err;
+		}
+		return body as any;
+	}
+
+	/**
+	 * Connects a GitLab account with a personal access token. `host` accepts
+	 * "gitlab.com" or a self-hosted hostname.
+	 */
+	async gitlabLogin(token: string, host = "gitlab.com") {
+		token = token.trim();
+		const saved = this.gitlabApiBase(host);
+		const user = await this.gitlab("/user", {}, token);
+		this.store.gitlab = {
+			token,
+			login: user.username ?? user.username,
+			name: user.name ?? null,
+			email: user.email ?? `${user.id}+${user.username}@users.noreply.${this.gitlabHost(host)}`,
+			avatarUrl: user.avatar_url ?? "",
+			host: this.gitlabHost(host),
+		};
+		// Re-pin the API base in case a token was entered for another host.
+		void saved;
+		this.save();
+		await this.configureGit();
+		return this.summary();
+	}
+
+	private gitlabHost(host = this.store.gitlab?.host) {
+		const raw = (host ?? "gitlab.com").replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+		return raw.split("/")[0];
+	}
+
+	async gitlabLogout() {
+		delete this.store.gitlab;
+		this.save();
+		await this.configureGit();
+		return this.summary();
+	}
+
+	/** Projects the signed-in user can see, via the GitLab projects API. */
+	private async gitlabRepos() {
+		if (!this.store.gitlab) return [];
+		const list: any[] = [];
+		for (let page = 1; page <= 5; page++) {
+			const batch = await this.gitlab(`/projects?membership=true&per_page=100&page=${page}&order_by=last_activity_at`).catch(() => []);
+			list.push(...(batch as any[]));
+			if (!Array.isArray(batch) || batch.length < 100) break;
+		}
+		return list.map((r) => ({
+			fullName: r.path_with_namespace,
+			name: r.name ?? r.path,
+			owner: r.namespace?.path ?? r.namespace?.full_path ?? "",
+			private: r.visibility !== "public",
+			description: r.description ?? null,
+			language: r.language ?? null,
+			// GitLab reports forks and stars under different names.
+			stars: r.star_count ?? 0,
+			forks: r.forks_count ?? 0,
+			pushedAt: r.last_activity_at,
+			defaultBranch: r.default_branch ?? "main",
+			host: this.gitlabHost(),
+			provider: "gitlab",
+			cloned: existsSync(join(this.workspace, r.path ?? r.name, ".git")),
+		}));
+	}
+
 	/**
 	 * Commit identity plus an auth header for github.com. A header rather than
 	 * a credential helper: helpers run through git's compiled-in shell path,
@@ -279,45 +382,85 @@ export class Integrations {
 		const gh = this.store.github;
 		const key = "http.https://github.com/.extraheader";
 		await run("git", ["config", "--global", "--unset-all", key], { cwd: this.home }).catch(() => {});
-		if (!gh) return;
-		const basic = Buffer.from(`x-access-token:${gh.token}`).toString("base64");
-		await run("git", ["config", "--global", "--add", key, `Authorization: Basic ${basic}`], { cwd: this.home });
-		await run("git", ["config", "--global", "user.name", gh.name ?? gh.login], { cwd: this.home });
-		await run("git", ["config", "--global", "user.email", gh.email], { cwd: this.home });
+		if (!gh && !this.store.gitlab) return;
+		const basic = (user: string, token: string) => `Authorization: Basic ${Buffer.from(`${user}:${token}`).toString("base64")}`;
+		if (gh) {
+			await run("git", ["config", "--global", "--add", key, basic("x-access-token", gh.token)], { cwd: this.home });
+			await run("git", ["config", "--global", "user.name", gh.name ?? gh.login], { cwd: this.home });
+			await run("git", ["config", "--global", "user.email", gh.email], { cwd: this.home });
+		} else {
+			// Keep a GitHub identity around even when only GitLab is connected.
+			await run("git", ["config", "--global", "user.name", "AndroPI"], { cwd: this.home });
+			await run("git", ["config", "--global", "user.email", "andropi@localhost"], { cwd: this.home });
+		}
+		const gl = this.store.gitlab;
+		if (gl) {
+			// gitlab.com and self-hosted instances use the same header format;
+			// any user works because a personal access token is used as the password.
+			const glKey = `http.https://${this.gitlabHost(gl.host)}/.extraheader`;
+			await run("git", ["config", "--global", "--unset-all", glKey], { cwd: this.home }).catch(() => {});
+			await run("git", ["config", "--global", "--add", glKey, basic("oauth2", gl.token)], { cwd: this.home });
+		}
 		await run("git", ["config", "--global", "init.defaultBranch", "main"], { cwd: this.home });
 	}
 
 	async repos() {
 		const list: any[] = [];
-		for (let page = 1; page <= 5; page++) {
-			const batch = await this.github(
-				`/user/repos?per_page=100&page=${page}&sort=pushed&affiliation=owner,collaborator,organization_member`,
-			);
-			list.push(...batch);
-			if (batch.length < 100) break;
+		if (this.store.github) {
+			for (let page = 1; page <= 5; page++) {
+				const batch = await this.github(
+					`/user/repos?per_page=100&page=${page}&sort=pushed&affiliation=owner,collaborator,organization_member`,
+				).catch(() => []);
+				list.push(...batch);
+				if (batch.length < 100) break;
+			}
 		}
-		return list.map((r) => ({
-			fullName: r.full_name,
+		if (this.store.gitlab) list.push(...(await this.gitlabRepos()));
+
+		const mapped = list.map((r) => ({
+			fullName: r.full_name ?? r.path_with_namespace,
 			name: r.name,
-			owner: r.owner?.login,
-			private: r.private,
+			owner: r.owner?.login ?? r.namespace?.path ?? r.owner ?? "",
+			private: r.private ?? r.visibility !== "public",
 			description: r.description ?? null,
 			language: r.language ?? null,
-			stars: r.stargazers_count ?? 0,
-			pushedAt: r.pushed_at,
-			defaultBranch: r.default_branch,
+			stars: r.stargazers_count ?? r.star_count ?? 0,
+			pushedAt: r.pushed_at ?? r.last_activity_at,
+			defaultBranch: r.default_branch ?? "main",
+			provider: r.provider ?? "github",
+			host: r.host ?? (r.path_with_namespace ? this.gitlabHost() : "github.com"),
 			cloned: existsSync(join(this.workspace, r.name, ".git")),
 		}));
+
+		// Most recently touched first, across both hosts.
+		return mapped.sort((a, b) => String(b.pushedAt ?? "").localeCompare(String(a.pushedAt ?? "")));
 	}
 
-	async clone(fullName: string, log: Log) {
-		const name = fullName.split("/").pop()!;
+	/**
+	 * Builds the clone URL for a repository. `owner/name` is expanded against
+	 * the right host; a full URL is used as-is so any Git server works.
+	 */
+	private cloneUrl(fullName: string, host = "github.com") {
+		if (/^(https?|git|ssh):\/\//i.test(fullName) || fullName.includes("@") && fullName.includes(":")) return fullName;
+		const base = host === "github.com" ? "https://github.com" : `https://${host}`;
+		return `${base}/${fullName}.git`;
+	}
+
+	/**
+	 * Clones a repository from GitHub or GitLab. `host` selects which one when
+	 * `fullName` is a plain "owner/repo"; GitLab needs it because a self-hosted
+	 * instance differs from gitlab.com.
+	 */
+	async clone(fullName: string, log: Log, host = "github.com") {
+		const name = fullName.replace(/\.git$/i, "").split(/[/:]/).pop()!;
 		const dest = join(this.workspace, name);
 		if (existsSync(join(dest, ".git"))) {
 			log(`${name} is already cloned`);
 			return { path: dest };
 		}
-		await run("git", ["clone", "--progress", `https://github.com/${fullName}.git`, dest], {
+		const url = this.cloneUrl(fullName, host);
+		log(`Cloning ${url}`);
+		await run("git", ["clone", "--progress", url, dest], {
 			cwd: this.workspace,
 			log,
 		});
@@ -344,6 +487,53 @@ export class Integrations {
 			out.push({ name, path: dir, git, branch, remote, dirty, modified: statSync(dir).mtimeMs });
 		}
 		return out.sort((a, b) => b.modified - a.modified);
+	}
+
+	/**
+	 * Resolves a project name to a directory inside the workspace, refusing
+	 * anything that escapes it. Guards delete and rename alike, so neither can
+	 * be pointed at the workspace root or at a path outside it.
+	 */
+	private projectDir(name: string) {
+		const clean = String(name ?? "").trim();
+		if (!clean) throw new Error("No project selected");
+		if (clean === "." || clean === ".." || clean.includes("/") || clean.includes("\\")) {
+			throw new Error("Pick a project from the list");
+		}
+		const dir = join(this.workspace, clean);
+		const root = resolve(this.workspace);
+		const target = resolve(dir);
+		if (target === root || !target.startsWith(root + sep())) throw new Error("That project is not inside the workspace");
+		if (!existsSync(target) || !statSync(target).isDirectory()) throw new Error(`No project folder named "${clean}"`);
+		return target;
+	}
+
+	/** Renames a project folder, refusing a name that would collide. */
+	async renameProject(name: string, next: string) {
+		const from = this.projectDir(name);
+		const to = String(next ?? "").trim();
+		if (!to) throw new Error("Enter a new name");
+		if (to === "." || to === ".." || to.includes("/") || to.includes("\\")) throw new Error("A project name cannot contain / or \\");
+		const dest = join(this.workspace, to);
+		const root = resolve(this.workspace);
+		if (resolve(dest) === root || !resolve(dest).startsWith(root + sep())) {
+			throw new Error("That name is not allowed");
+		}
+		if (existsSync(dest)) throw new Error(`"${to}" already exists`);
+		// A running session must not be left pointing at a vanished folder.
+		await run("git", ["config", "--global", "--unset-all", "safe.directory"], { cwd: this.home }).catch(() => {});
+		renameSync(from, dest);
+		return { name: to, path: dest };
+	}
+
+	/**
+	 * Deletes a project folder and everything in it. Refuses to run when the
+	 * folder is the workspace root or lies outside it.
+	 */
+	deleteProject(name: string) {
+		const dir = this.projectDir(name);
+		rmSync(dir, { recursive: true, force: true });
+		return { name, deleted: true };
 	}
 
 	// -------------------------------------------------------------------------

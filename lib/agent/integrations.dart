@@ -13,6 +13,16 @@ class GithubAccount {
   String? get avatarUrl => json['avatarUrl'] as String?;
 }
 
+class GitlabAccount {
+  GitlabAccount(this.json);
+  final Map<String, dynamic> json;
+
+  String get login => json['login'] as String;
+  String? get name => json['name'] as String?;
+  String? get avatarUrl => json['avatarUrl'] as String?;
+  String get host => json['host'] as String? ?? 'gitlab.com';
+}
+
 class SshHost {
   SshHost(this.json);
   final Map<String, dynamic> json;
@@ -38,6 +48,14 @@ class RepoInfo {
   int get stars => json['stars'] as int? ?? 0;
   DateTime? get pushedAt => DateTime.tryParse(json['pushedAt'] as String? ?? '');
   bool get cloned => json['cloned'] == true;
+
+  /// Which forge the repository lives on.
+  String get provider => json['provider'] as String? ?? 'github';
+
+  /// Host serving it: github.com, gitlab.com, or a self-hosted instance.
+  String get host => json['host'] as String? ?? (provider == 'gitlab' ? 'gitlab.com' : 'github.com');
+
+  bool get isGitlab => provider == 'gitlab';
 }
 
 class ProjectInfo {
@@ -131,6 +149,7 @@ class Integrations extends ChangeNotifier {
   int _nextTask = 1;
 
   GithubAccount? github;
+  GitlabAccount? gitlab;
   String? vercelUser;
   String? publicKey;
   List<SshHost> hosts = const [];
@@ -141,6 +160,8 @@ class Integrations extends ChangeNotifier {
     final s = (summary as Map).cast<String, dynamic>();
     final gh = s['github'];
     github = gh == null ? null : GithubAccount((gh as Map).cast<String, dynamic>());
+    final gl = s['gitlab'];
+    gitlab = gl == null ? null : GitlabAccount((gl as Map).cast<String, dynamic>());
     vercelUser = (s['vercel'] as Map?)?['username'] as String?;
     final ssh = (s['ssh'] as Map).cast<String, dynamic>();
     publicKey = ssh['publicKey'] as String?;
@@ -219,15 +240,35 @@ class Integrations extends ChangeNotifier {
 
   Future<void> githubLogout() async => _apply(await client.call('github_logout'));
 
+  // GitLab. [host] is "gitlab.com" or a self-hosted instance.
+  Future<void> gitlabLogin(String token, {String host = 'gitlab.com'}) async =>
+      _apply(await client.call('gitlab_login', {'token': token, 'host': host}));
+
+  Future<void> gitlabLogout() async => _apply(await client.call('gitlab_logout'));
+
+  /// Repositories from every connected account, GitHub and GitLab alike.
   Future<List<RepoInfo>> repos() async {
     final list = await client.call<List>('github_repos');
     return list.map((e) => RepoInfo((e as Map).cast<String, dynamic>())).toList();
   }
 
-  Future<String> clone(String fullName, {void Function(String)? onLine}) async {
-    final result = await _task<Map>('git_clone', {'repo': fullName}, onLine);
+  /// Clones [fullName] from [host]. A full URL is cloned as-is, so any Git
+  /// server works even when no account is connected.
+  Future<String> clone(String fullName, {String host = 'github.com', void Function(String)? onLine}) async {
+    final result = await _task<Map>('git_clone', {'repo': fullName, 'host': host}, onLine);
     unawaited(refreshProjects());
     return result['path'] as String;
+  }
+
+  // Projects in the workspace
+  Future<void> renameProject(String name, String next) async {
+    await client.call('project_rename', {'name': name, 'next': next});
+    await refreshProjects();
+  }
+
+  Future<void> deleteProject(String name) async {
+    await client.call('project_delete', {'name': name});
+    await refreshProjects();
   }
 
   // Vercel

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 
+import '../agent/agent_client.dart';
 import '../agent/agent_controller.dart';
 import '../agent/models.dart';
 import 'settings_screen.dart';
@@ -26,6 +27,23 @@ class _ModelSheet extends StatefulWidget {
 
 class _ModelSheetState extends State<_ModelSheet> {
   String query = '';
+  bool refreshing = false;
+
+  /// Re-reads every provider's model list from its API.
+  Future<void> _reload() async {
+    setState(() => refreshing = true);
+    try {
+      await widget.agent.reloadModels();
+    } on AgentError catch (e) {
+      if (mounted) _message(context, e.message);
+    } finally {
+      if (mounted) setState(() => refreshing = false);
+    }
+  }
+
+  void _message(BuildContext context, String text) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -56,6 +74,13 @@ class _ModelSheetState extends State<_ModelSheet> {
                 child: Row(
                   children: [
                     Expanded(child: Text('Model', style: text.titleLarge)),
+                    TextButton.icon(
+                      onPressed: refreshing ? null : _reload,
+                      icon: refreshing
+                          ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
+                          : const Icon(LucideIcons.refreshCw, size: 16),
+                      label: const Text('Refresh'),
+                    ),
                     TextButton(
                       onPressed: () {
                         final nav = Navigator.of(context)..pop();
@@ -129,9 +154,38 @@ class _ModelTile extends StatelessWidget {
         Navigator.of(context).pop();
         await agent.setModel(model);
       },
-      title: Text(model.name, maxLines: 1, overflow: TextOverflow.ellipsis),
+      title: Row(
+        children: [
+          Flexible(child: Text(model.name, maxLines: 1, overflow: TextOverflow.ellipsis)),
+          if (model.isFree) ...[
+            const SizedBox(width: 8),
+            _FreeTag(color: p.muted),
+          ],
+        ],
+      ),
       subtitle: details.isEmpty ? null : Text(details),
       trailing: selected ? Icon(LucideIcons.check, size: 18, color: p.text) : null,
+    );
+  }
+}
+
+/// Marks models that cost nothing per token, including local ones.
+class _FreeTag extends StatelessWidget {
+  const _FreeTag({required this.color});
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+      decoration: BoxDecoration(
+        border: Border.all(color: color),
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: Text(
+        'FREE',
+        style: Theme.of(context).textTheme.labelSmall?.copyWith(color: color, fontSize: 9, letterSpacing: 0.5),
+      ),
     );
   }
 }

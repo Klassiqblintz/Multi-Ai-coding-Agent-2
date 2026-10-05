@@ -8,7 +8,7 @@ import 'accounts_screen.dart';
 import 'task_log.dart';
 import 'theme.dart';
 
-/// Pick a GitHub repository, clone it into the workspace and start a session in it.
+/// Pick a GitHub or GitLab repository, clone it into the workspace and start a session in it.
 class ReposScreen extends StatefulWidget {
   const ReposScreen({super.key, required this.agent});
   final AgentController agent;
@@ -25,14 +25,58 @@ class _ReposScreenState extends State<ReposScreen> {
   @override
   void initState() {
     super.initState();
-    if (it.github != null) repos = it.repos();
+    if (it.github != null || it.gitlab != null) repos = it.repos();
   }
+
+  /// True when no forge is connected, so the list has nothing to show.
+  bool get _disconnected => it.github == null && it.gitlab == null;
 
   Future<void> _open(RepoInfo repo) async {
     final path = await runWithLog<String>(
       context,
       title: repo.cloned ? 'Opening ${repo.name}' : 'Cloning ${repo.fullName}',
-      task: (log, _) => it.clone(repo.fullName, onLine: log),
+      task: (log, _) => it.clone(repo.fullName, host: repo.host, onLine: log),
+    );
+    if (path == null || !mounted) return;
+    await widget.agent.newSession(dir: path);
+    if (mounted) Navigator.of(context).popUntil((r) => r.isFirst);
+  }
+
+  /// Clones a URL the user typed, for any Git server.
+  Future<void> _cloneUrl() async {
+    final controller = TextEditingController();
+    final url = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Clone from URL'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text('Any Git host works: GitHub, GitLab or a self-hosted instance.'),
+            const SizedBox(height: 16),
+            TextField(
+              controller: controller,
+              autofocus: true,
+              keyboardType: TextInputType.url,
+              autocorrect: false,
+              decoration: const InputDecoration(hintText: 'https://github.com/owner/repo.git'),
+              onSubmitted: (v) => Navigator.of(context).pop(v.trim()),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.of(context).pop(controller.text.trim()), child: const Text('Clone')),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (url == null || url.isEmpty || !mounted) return;
+
+    final path = await runWithLog<String>(
+      context,
+      title: 'Cloning',
+      task: (log, _) => it.clone(url, onLine: log),
     );
     if (path == null || !mounted) return;
     await widget.agent.newSession(dir: path);
@@ -51,29 +95,31 @@ class _ReposScreenState extends State<ReposScreen> {
           child: Divider(height: 1, color: p.border),
         ),
       ),
-      body: it.github == null
+      body: _disconnected
           ? Center(
               child: Padding(
                 padding: const EdgeInsets.all(32),
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    Icon(SimpleIcons.github, size: 32, color: p.muted),
+                    Icon(SimpleIcons.gitlab, size: 32, color: p.muted),
                     const SizedBox(height: 12),
-                    Text('Connect GitHub to see your repositories', style: text.titleSmall),
+                    Text('Connect GitHub or GitLab to see your repositories', style: text.titleSmall, textAlign: TextAlign.center),
                     const SizedBox(height: 16),
                     FilledButton(
                       onPressed: () async {
                         await Navigator.of(context)
                             .push(MaterialPageRoute(builder: (_) => AccountsScreen(agent: widget.agent)));
-                        if (mounted && it.github != null) {
+                        if (mounted && !_disconnected) {
                           setState(() {
                             repos = it.repos();
                           });
                         }
                       },
-                      child: const Text('Connect GitHub'),
+                      child: const Text('Connect an account'),
                     ),
+                    const SizedBox(height: 10),
+                    TextButton(onPressed: _cloneUrl, child: const Text('Clone from a URL instead')),
                   ],
                 ),
               ),
@@ -82,12 +128,23 @@ class _ReposScreenState extends State<ReposScreen> {
               children: [
                 Padding(
                   padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
-                  child: TextField(
-                    onChanged: (v) => setState(() => query = v.toLowerCase()),
-                    decoration: const InputDecoration(
-                      hintText: 'Search repositories',
-                      prefixIcon: Icon(LucideIcons.search, size: 18),
-                    ),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: TextField(
+                          onChanged: (v) => setState(() => query = v.toLowerCase()),
+                          decoration: const InputDecoration(
+                            hintText: 'Search repositories',
+                            prefixIcon: Icon(LucideIcons.search, size: 18),
+                          ),
+                        ),
+                      ),
+                      IconButton(
+                        tooltip: 'Clone from URL',
+                        onPressed: _cloneUrl,
+                        icon: const Icon(LucideIcons.link, size: 18),
+                      ),
+                    ],
                   ),
                 ),
                 Expanded(
@@ -153,7 +210,9 @@ class _RepoTile extends StatelessWidget {
           children: [
             Padding(
               padding: const EdgeInsets.only(top: 2),
-              child: Icon(repo.isPrivate ? LucideIcons.lock : LucideIcons.bookMarked, size: 18, color: p.muted),
+              child: repo.isGitlab
+                  ? Icon(SimpleIcons.gitlab, size: 18, color: p.muted)
+                  : Icon(repo.isPrivate ? LucideIcons.lock : LucideIcons.bookMarked, size: 18, color: p.muted),
             ),
             const SizedBox(width: 12),
             Expanded(

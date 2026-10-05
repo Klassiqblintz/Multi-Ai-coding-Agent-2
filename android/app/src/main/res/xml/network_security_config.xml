@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Local model servers (#6).
+
+  Android blocks cleartext HTTP by default, which would stop the app reaching
+  Ollama, LM Studio, llama.cpp or vLLM running on the device or on the same
+  network — those speak plain HTTP only.
+
+  Android's network security config matches cleartext exceptions by *hostname*,
+  not by address range, so an arbitrary LAN address (192.168.1.57, say) cannot
+  be enumerated in advance. Cleartext is therefore permitted here, while HTTPS
+  remains the norm for every real provider: keys for OpenRouter, OpenAI and the
+  rest still travel over TLS, and their published endpoints are https.
+
+  `localhost` and the loopback addresses are listed explicitly so on-device
+  servers keep working even if this base rule is tightened later.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system"/>
+        </trust-anchors>
+    </base-config>
+
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">localhost</domain>
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">::1</domain>
+    </domain-config>
+</network-security-config>

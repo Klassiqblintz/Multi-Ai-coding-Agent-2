@@ -20,6 +20,8 @@ class AccountsScreen extends StatefulWidget {
 }
 
 class _AccountsScreenState extends State<AccountsScreen> {
+  /// Host typed for a self-hosted GitLab; null means gitlab.com.
+  String? _gitlabHost;
   Integrations get it => widget.agent.integrations;
 
   @override
@@ -83,6 +85,36 @@ class _AccountsScreenState extends State<AccountsScreen> {
                           title: it.github!.name ?? it.github!.login,
                           subtitle: '@${it.github!.login} · git push and Pages enabled',
                           onDisconnect: () => _guard(it.githubLogout),
+                        ),
+                  const _Header('GitLab'),
+                  it.gitlab == null
+                      ? _TokenConnect(
+                          icon: SimpleIcons.gitlab,
+                          title: 'Connect GitLab',
+                          body:
+                              'Clone from gitlab.com or a self-hosted instance and push with your own token. '
+                              'Create a personal access token with the api scope, then paste it here.',
+                          linkLabel: 'Create a token',
+                          onLink: () => widget.agent.client.openUrl(
+                            'https://gitlab.com/-/user_settings/personal_access_tokens?name=AndroPI&scopes=api',
+                          ),
+                          hint: 'glpat-…',
+                          // gitlab.com by default; a self-hosted instance is
+                          // entered alongside the token.
+                          onConnect: (t) => _guard(
+                            () => it.gitlabLogin(t, host: _gitlabHost ?? 'gitlab.com'),
+                            success: 'GitLab connected',
+                          ),
+                          extraField: _GitlabHostField(
+                            onChanged: (v) => _gitlabHost = v.trim().isEmpty ? null : v.trim(),
+                          ),
+                        )
+                      : _Connected(
+                          avatarUrl: it.gitlab!.avatarUrl,
+                          icon: SimpleIcons.gitlab,
+                          title: it.gitlab!.name ?? it.gitlab!.login,
+                          subtitle: '@${it.gitlab!.login} on ${it.gitlab!.host}',
+                          onDisconnect: () => _guard(it.gitlabLogout),
                         ),
                   const _Header('Vercel'),
                   it.vercelUser == null
@@ -346,6 +378,7 @@ class _TokenConnect extends StatefulWidget {
     required this.onLink,
     required this.hint,
     required this.onConnect,
+    this.extraField,
   });
   final IconData icon;
   final String title;
@@ -354,6 +387,9 @@ class _TokenConnect extends StatefulWidget {
   final VoidCallback onLink;
   final String hint;
   final Future<void> Function(String token) onConnect;
+
+  /// Optional input shown above the token field, e.g. a self-hosted hostname.
+  final Widget? extraField;
 
   @override
   State<_TokenConnect> createState() => _TokenConnectState();
@@ -402,6 +438,7 @@ class _TokenConnectState extends State<_TokenConnect> {
               label: Text(widget.linkLabel),
             ),
           ),
+          if (widget.extraField != null) ...[widget.extraField!, const SizedBox(height: 10)],
           TextField(
             controller: token,
             obscureText: true,
@@ -680,6 +717,41 @@ class _HostSheetState extends State<_HostSheet> {
           ),
         ),
       ),
+    );
+  }
+}
+
+/// Hostname input for a self-hosted GitLab. Empty means gitlab.com.
+class _GitlabHostField extends StatefulWidget {
+  const _GitlabHostField({required this.onChanged});
+  final ValueChanged<String> onChanged;
+
+  @override
+  State<_GitlabHostField> createState() => _GitlabHostFieldState();
+}
+
+class _GitlabHostFieldState extends State<_GitlabHostField> {
+  final host = TextEditingController();
+
+  @override
+  void dispose() {
+    host.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return TextField(
+      controller: host,
+      autocorrect: false,
+      enableSuggestions: false,
+      keyboardType: TextInputType.url,
+      decoration: const InputDecoration(
+        labelText: 'Instance (optional)',
+        hintText: 'gitlab.com',
+        prefixIcon: Icon(LucideIcons.server, size: 18),
+      ),
+      onChanged: widget.onChanged,
     );
   }
 }

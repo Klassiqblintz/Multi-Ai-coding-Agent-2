@@ -18,6 +18,7 @@ import 'kit.dart';
 import 'illustration.dart';
 import 'mesh.dart';
 import 'new_chat_sheet.dart';
+import 'preview_screen.dart';
 import 'repos_screen.dart';
 import 'settings_hub.dart';
 import 'settings_screen.dart';
@@ -1056,6 +1057,144 @@ class _ProjectsTabState extends State<_ProjectsTab> {
     if (mounted) await openChat(context, agent);
   }
 
+  /// Opens the project's site in the WebView. Finds the usual entry files so a
+  /// plain static page works with no dev server running.
+  Future<void> _preview(ProjectInfo project) async {
+    final entry = _entryFile(project.path);
+    if (entry == null) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('No index.html or site folder found in ${project.name}. Ask pi to build the site first.'),
+          action: SnackBarAction(
+            label: 'Open',
+            onPressed: () => _open(project),
+          ),
+        ),
+      );
+      return;
+    }
+    if (!mounted) return;
+    await HtmlPreviewScreen.open(
+      context,
+      title: project.name,
+      source: () => File(entry.path).readAsStringSync(),
+      baseDir: entry.baseDir,
+      live: it,
+    );
+  }
+
+  /// Picks the file to preview: an entry point at the root, else the index of a
+  /// common site folder.
+  ({String path, String baseDir})? _entryFile(String dir) {
+    const candidates = [
+      'index.html',
+      'dist/index.html',
+      'build/index.html',
+      'public/index.html',
+      'www/index.html',
+      'src/index.html',
+    ];
+    for (final rel in candidates) {
+      final path = '${dir.endsWith('/') ? dir : '$dir/'}$rel';
+      if (File(path).existsSync()) {
+        // Relative assets resolve against the file's own folder.
+        final slash = path.lastIndexOf('/');
+        return (path: path, baseDir: path.substring(0, slash));
+      }
+    }
+    return null;
+  }
+
+  Future<void> _rename(ProjectInfo project) async {
+    final controller = TextEditingController(text: project.name);
+    final name = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Rename project'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(labelText: 'Folder name'),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.of(context).pop(controller.text.trim()), child: const Text('Rename')),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (name == null || name.isEmpty || name == project.name || !mounted) return;
+    try {
+      await it.renameProject(project.name, name);
+    } catch (e) {
+      if (mounted) _toast(e.toString());
+    }
+  }
+
+  Future<void> _delete(ProjectInfo project) async {
+    // Typed confirmation: the folder and everything in it goes for good.
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => _DeleteProjectDialog(name: project.name),
+    );
+    if (confirmed != true || !mounted) return;
+    try {
+      await it.deleteProject(project.name);
+    } catch (e) {
+      if (mounted) _toast(e.toString());
+    }
+  }
+
+  void _toast(String text) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
+  }
+
+  Future<void> _projectMenu(ProjectInfo project) async {
+    final action = await showModalBottomSheet<String>(
+      context: context,
+      builder: (context) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(LucideIcons.monitorPlay),
+              title: const Text('Preview site'),
+              subtitle: const Text('Open this project in the browser'),
+              onTap: () => Navigator.of(context).pop('preview'),
+            ),
+            ListTile(
+              leading: const Icon(LucideIcons.folderOpen),
+              title: const Text('Open'),
+              onTap: () => Navigator.of(context).pop('open'),
+            ),
+            ListTile(
+              leading: const Icon(LucideIcons.pencil),
+              title: const Text('Rename'),
+              onTap: () => Navigator.of(context).pop('rename'),
+            ),
+            ListTile(
+              leading: Icon(LucideIcons.trash2, color: context.palette.danger),
+              title: Text('Delete', style: TextStyle(color: context.palette.danger)),
+              onTap: () => Navigator.of(context).pop('delete'),
+            ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+    switch (action) {
+      case 'preview':
+        await _preview(project);
+      case 'open':
+        await _open(project);
+      case 'rename':
+        await _rename(project);
+      case 'delete':
+        await _delete(project);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final p = context.palette;
@@ -1146,6 +1285,7 @@ class _ProjectsTabState extends State<_ProjectsTab> {
                         final pr = projects[i];
                         return GestureDetector(
                           onTap: () => _open(pr),
+                          onLongPress: () => _projectMenu(pr),
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
@@ -1220,6 +1360,62 @@ class _ProjectsTabState extends State<_ProjectsTab> {
           ),
         );
       },
+    );
+  }
+}
+
+/// Delete confirmation for a project folder. The name must be typed, so a
+/// destructive tap cannot lose work.
+class _DeleteProjectDialog extends StatefulWidget {
+  const _DeleteProjectDialog({required this.name});
+  final String name;
+
+  @override
+  State<_DeleteProjectDialog> createState() => _DeleteProjectDialogState();
+}
+
+class _DeleteProjectDialogState extends State<_DeleteProjectDialog> {
+  final typed = TextEditingController();
+  bool match = false;
+
+  @override
+  void initState() {
+    super.initState();
+    typed.addListener(() => setState(() => match = typed.text.trim() == widget.name));
+  }
+
+  @override
+  void dispose() {
+    typed.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final p = context.palette;
+    return AlertDialog(
+      title: Text('Delete ${widget.name}?'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('The folder and everything inside it are removed from this device. This cannot be undone.'),
+          const SizedBox(height: 16),
+          TextField(
+            controller: typed,
+            autofocus: true,
+            decoration: InputDecoration(labelText: 'Type ${widget.name} to confirm'),
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.of(context).pop(false), child: const Text('Cancel')),
+        FilledButton(
+          style: FilledButton.styleFrom(backgroundColor: p.danger),
+          onPressed: match ? () => Navigator.of(context).pop(true) : null,
+          child: const Text('Delete'),
+        ),
+      ],
     );
   }
 }

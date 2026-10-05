@@ -154,6 +154,41 @@ class AgentController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Re-pulls each provider's model list from its API, so the picker reflects
+  /// what the connected key can actually reach right now.
+  Future<void> reloadModels({String? provider}) async {
+    await client.call('refresh_models', {'provider': ?provider, 'force': true});
+    await refreshProviders();
+  }
+
+  /// Providers the user added by hand, including local inference servers.
+  Future<List<CustomProvider>> customProviders() async {
+    final list = await client.call<List>('custom_providers');
+    return list.map((e) => CustomProvider((e as Map).cast<String, dynamic>())).toList();
+  }
+
+  /// Registers an OpenAI-compatible endpoint. [apiKey] may be empty for local
+  /// servers such as Ollama or LM Studio.
+  Future<void> addProvider({
+    required String name,
+    required String baseUrl,
+    String? apiKey,
+    String api = 'openai-completions',
+  }) async {
+    await client.call('add_provider', {
+      'name': name,
+      'baseUrl': baseUrl,
+      if (apiKey != null && apiKey.isNotEmpty) 'apiKey': apiKey,
+      'api': api,
+    });
+    await refreshProviders();
+  }
+
+  Future<void> removeProvider(String id) async {
+    await client.call('remove_provider', {'provider': id});
+    await refreshProviders();
+  }
+
   Future<void> setModel(ModelInfo m) async {
     _applyState(await client.call<Map<String, dynamic>>('set_model', {'provider': m.provider, 'model': m.id}));
     notifyListeners();
