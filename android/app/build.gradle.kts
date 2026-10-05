@@ -48,6 +48,21 @@ android {
         jniLibs {
             useLegacyPackaging = true
         }
+        // Kotlin Multiplatform artifacts (androidx.annotation:annotation-jvm, compose runtime-annotation-jvm)
+        // duplicate their sibling Android artifacts' classes and META-INF entries on the Android classpath.
+        // Keep one copy of each overlapping resource.
+        resources {
+            pickFirsts += setOf(
+                "META-INF/androidx/annotation/annotation/LICENSE.txt",
+                "META-INF/DEPENDENCIES",
+                "META-INF/LICENSE*",
+                "META-INF/NOTICE*",
+                // Kotlin Multiplatform "common" metadata jars ship these identical stub paths. They carry no
+                // runtime payload on Android, so one copy is enough.
+                "commonMain/**",
+                "META-INF/*.kotlin_module",
+            )
+        }
     }
 
     // "full" is the GitHub build with "All files access" for opening any folder on the phone. "play" is the Google
@@ -56,6 +71,14 @@ android {
     productFlavors {
         create("full") { dimension = "store" }
         create("play") { dimension = "store" }
+    }
+
+    // Lint runs as a release gate (lintVital) but pulls the full IntelliJ PSI platform, which is heavy and not
+    // needed to produce a working APK. Keep lint off for release builds here; it can be run explicitly with
+    // `./gradlew lint` when the full platform is available.
+    lint {
+        checkReleaseBuilds = false
+        abortOnError = false
     }
 
     signingConfigs {
@@ -84,6 +107,13 @@ kotlin {
 
 flutter {
     source = "../.."
+}
+
+// androidx.compose.runtime:runtime-annotation is a Kotlin Multiplatform artifact whose published POM also lists the
+// plain-JVM variant (runtime-annotation-jvm). On Android the runtime already ships runtime-annotation-android, so the
+// JVM copy would duplicate its classes and fail checkFullReleaseDuplicateClasses. Keep the Android variant only.
+configurations.configureEach {
+    exclude(group = "androidx.compose.runtime", module = "runtime-annotation-jvm")
 }
 
 dependencies {

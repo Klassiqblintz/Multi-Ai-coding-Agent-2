@@ -1,8 +1,5 @@
 allprojects {
     repositories {
-        // Prefer the pre-provisioned offline Maven repo so the build never depends
-        // on the flaky network. google()/mavenCentral() remain as fallbacks.
-        maven { url = uri("/root/maven/localMvnRepository") }
         google()
         mavenCentral()
     }
